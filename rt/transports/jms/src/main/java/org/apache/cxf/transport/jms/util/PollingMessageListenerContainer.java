@@ -51,17 +51,18 @@ public class PollingMessageListenerContainer extends AbstractMessageListenerCont
         this.listenerHandler = listenerHandler;
     }
 
-    private class Poller implements Runnable {
+    private class Poller extends AbstractPoller implements Runnable {
 
         @Override
         public void run() {
+            Session session = null;
+            init();
             while (running) {
-                MessageConsumer consumer = null;
-                Session session = null;
-                try {
+                try (ResourceCloser closer = new ResourceCloser()) {
+                    closer.register(createInitialContext());
                     // Create session early to optimize performance
-                    session = connection.createSession(transacted, acknowledgeMode);
-                    consumer = createConsumer(session);
+                    session = closer.register(connection.createSession(transacted, acknowledgeMode));
+                    MessageConsumer consumer = closer.register(createConsumer(session));
                     while (running) {
                         Message message = consumer.receive(1000);
                         try {
@@ -73,22 +74,20 @@ public class PollingMessageListenerContainer extends AbstractMessageListenerCont
                             }
                         } catch (Exception e) {
                             LOG.log(Level.WARNING, "Exception while processing jms message in cxf. Rolling back", e);
-                            safeRollBack(session, e);
+                            safeRollBack(session);
                         }
                     }
                 } catch (Exception e) {
-                    LOG.log(Level.WARNING, "Unexpected exception. Restarting session and consumer", e);
-                } finally {
-                    ResourceCloser.close(consumer);
-                    ResourceCloser.close(session);
+                    catchUnexpectedExceptionDuringPolling(null, e);
                 }
             }
 
         }
         
-        private void safeRollBack(Session session, Exception e) {
+        @Override
+        protected void safeRollBack(Session session) {
             try {
-                if (session.getTransacted()) {
+                if (session != null && session.getTransacted()) {
                     session.rollback();
                 }
             } catch (Exception e1) {
@@ -98,14 +97,14 @@ public class PollingMessageListenerContainer extends AbstractMessageListenerCont
 
     }
     
-    private class XAPoller implements Runnable {
+    private class XAPoller extends AbstractPoller implements Runnable {
 
         @Override
         public void run() {
+            init();
             while (running) {
-                MessageConsumer consumer = null;
-                Session session = null;
-                try {
+                try (ResourceCloser closer = new ResourceCloser()) {
+                    closer.register(createInitialContext());
                     final Transaction externalTransaction = transactionManager.getTransaction();
                     if ((externalTransaction != null) && (externalTransaction.getStatus() == Status.STATUS_ACTIVE)) {
                         LOG.log(Level.SEVERE, "External transactions are not supported in XAPoller");
@@ -116,8 +115,8 @@ public class PollingMessageListenerContainer extends AbstractMessageListenerCont
                      * Create session inside transaction to give it the 
                      * chance to enlist itself as a resource
                      */
-                    session = connection.createSession(transacted, acknowledgeMode);
-                    consumer = createConsumer(session);
+                    Session session = closer.register(connection.createSession(transacted, acknowledgeMode));
+                    MessageConsumer consumer = closer.register(createConsumer(session));
                     Message message = consumer.receive(1000);
                     try {
                         if (message != null) {
@@ -127,19 +126,17 @@ public class PollingMessageListenerContainer extends AbstractMessageListenerCont
                     } catch (Throwable e) {
                         LOG.log(Level.WARNING, "Exception while processing jms message in cxf. Rolling back", e);
                         safeRollBack(session);
-                    } finally {
-                        ResourceCloser.close(consumer);
-                        ResourceCloser.close(session);
                     }
                 } catch (Exception e) {
-                    LOG.log(Level.WARNING, "Unexpected exception. Restarting session and consumer", e);
+                    catchUnexpectedExceptionDuringPolling(null, e);
                 }
 
             }
 
         }
-        
-        private void safeRollBack(Session session) {
+
+        @Override
+        protected void safeRollBack(Session session) {
             try {
                 transactionManager.rollback();
             } catch (Exception e) {
@@ -149,6 +146,63 @@ public class PollingMessageListenerContainer extends AbstractMessageListenerCont
 
     }
     
+    private abstract class AbstractPoller {
+        private static final String RETRY_COUNTER_ON_EXCEPTION = "jms.polling.retrycounteronexception";
+        private static final String SLEEPING_TIME_BEFORE_RETRY = "jms.polling.sleepingtimebeforeretry";
+        protected int retryCounter = -1;
+        protected int counter;
+        protected int sleepingTime = 5000;
+
+        protected void init() {
+            if (jndiEnvironment != null) {
+                if (jndiEnvironment.containsKey(RETRY_COUNTER_ON_EXCEPTION)) {
+                    retryCounter = Integer.valueOf(jndiEnvironment.getProperty(RETRY_COUNTER_ON_EXCEPTION));
+                }
+                if (jndiEnvironment.containsKey(SLEEPING_TIME_BEFORE_RETRY)) {
+                    sleepingTime = Integer.valueOf(jndiEnvironment.getProperty(SLEEPING_TIME_BEFORE_RETRY));
+                }
+            }
+        }
+
+        protected boolean hasToCount() {
+            return retryCounter > -1;
+        }
+
+        protected boolean hasToStop() {
+            return counter > retryCounter;
+        }
+
+        protected void catchUnexpectedExceptionDuringPolling(Session session, Throwable e) {
+            LOG.log(Level.WARNING, "Unexpected exception.", e);
+            if (hasToCount()) {
+                counter++;
+                if (hasToStop()) {
+                    stop(session, e);
+                }
+            }
+            if (running) {
+                try {
+                    String log = "Now sleeping for " + sleepingTime / 1000 + " seconds";
+                    log += hasToCount() ? ". Then restarting session and consumer: attempt " 
+                                          + counter + "/" + retryCounter : "";
+                    LOG.log(Level.WARNING, log);
+                    Thread.sleep(sleepingTime);
+                } catch (InterruptedException e1) {
+                    LOG.log(Level.WARNING, e1.getMessage());
+                }
+            }
+        }
+
+        protected void stop(Session session, Throwable e) {
+            LOG.log(Level.WARNING, "Stopping the jms message polling thread in cxf", e);
+            safeRollBack(session);
+            running = false;
+        }
+
+        protected abstract void safeRollBack(Session session);
+
+    }
+
     private MessageConsumer createConsumer(Session session) throws JMSException {
         if (durableSubscriptionName != null && destination instanceof Topic) {
             return session.createDurableSubscriber((Topic)destination, durableSubscriptionName,
